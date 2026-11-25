@@ -38,6 +38,7 @@ captures/
 
 # Keystore files
 *.jks
+.signing/
 
 # Mac OS X clutter
 *.DS_Store
