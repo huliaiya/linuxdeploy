@@ -1,12 +1,15 @@
-name: Android Build
+name: Android Build and Release
 
 on:
   push:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,14 +24,65 @@ jobs:
           distribution: temurin
           java-version: "8"
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x gradlew
+      - name: Check signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::GitHub Secret $name is not configured"
+              exit 1
+            fi
+          done
 
-      - name: Build debug APK
-        run: ./gradlew assembleDebug
+      - name: Decode signing keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+          chmod 600 "$RUNNER_TEMP/release.keystore"
 
-      - name: Upload APK
+      - name: Build and sign release APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          SIGNED_APK="$RUNNER_TEMP/linux-deploy-release.apk"
+          APK_SIGNER="$ANDROID_HOME/build-tools/29.0.2/apksigner"
+
+          "$APK_SIGNER" sign \
+            --ks "$RUNNER_TEMP/release.keystore" \
+            --ks-pass "env:ANDROID_KEYSTORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass "env:ANDROID_KEY_PASSWORD" \
+            --out "$SIGNED_APK" \
+            "$UNSIGNED_APK"
+          "$APK_SIGNER" verify "$SIGNED_APK"
+          echo "RELEASE_APK=$SIGNED_APK" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-deploy-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: linux-deploy-release
+          path: ${{ env.RELEASE_APK }}
+          if-no-files-found: error
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_TAG="master-${GITHUB_RUN_NUMBER}"
+          gh release create "$RELEASE_TAG" "$RELEASE_APK" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Master build ${GITHUB_RUN_NUMBER}" \
+            --notes "Automated signed build from commit ${GITHUB_SHA}." \
+            --prerelease
